@@ -1,0 +1,34 @@
+<?php
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Route;
+use App\Http\Controllers\InventoryMovementController;
+
+Route::middleware('auth:sanctum')->get('/user', function (Request $request) {
+    return $request->user();
+});
+
+Route::get('/test', function () {
+    return response()->json([
+        'message' => 'API is working!',
+        'time' => now()
+    ]);
+});
+
+Route::get('/health', function () {
+    return response()->json([
+        'status' => 'healthy',
+        'time' => now()
+    ]);
+});
+
+Route::get('/inventory-movements', [InventoryMovementController::class, 'index']);
+Route::post('/inventory-movements/da-to-da', [InventoryMovementController::class, 'storeDaToDA']);
+Route::get('/movements/stats', [InventoryMovementController::class, 'stats']);
+
+// Return Management Routes
+Route::prefix('returns')->group(function () {
+    Route::post('/da', [App\Http\Controllers\ReturnController::class, 'storeDAReturn']);
+    Route::post('/factory', [App\Http\Controllers\ReturnController::class, 'storeFactoryReturn']);
+    Route::get('/stats', [App\Http\Controllers\ReturnController::class, 'stats']);
+});

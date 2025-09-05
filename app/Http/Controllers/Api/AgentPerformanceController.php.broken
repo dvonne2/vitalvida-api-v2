@@ -1,0 +1,170 @@
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use App\Models\User;
+use App\Models\DeliveryAgent; // Use existing DeliveryAgent model
+use App\Models\Bin;
+use Illuminate\Http\Request;
+use IlluminateSupportFacadesValidator;
+use IlluminateSupportFacadesValidator;
+use Illuminate\Http\JsonResponse;
+use Illuminate\Support\Facades\Validator;
+
+class AgentPerformanceController extends Controller
+{
+    /**
+     * Get delivery agent rankings using existing DeliveryAgent records
+     */
+    public function getRankings(Request $request): JsonResponse
+    {
+        $validator = Validator::make($request->all(), [
+            'limit' => 'nullable|integer|min:1|max:100',
+            'status' => 'nullable|in:all,excellent,good,warning,critical',
+            'search' => 'nullable|string|max:100',
+        ]);
+
+        if ($validator->fails()) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Validation failed',
+                'errors' => $validator->errors()
+            ], 422);
+        }
+
+        $limit = $request->get('limit', 10);
+        
+        // Get delivery agents with their users
+        $agents = DeliveryAgent::with('user')
+            ->active()
+            ->get()
+            ->map(function ($agent) {
+                return [
+                    'id' => $agent->user->id,
+                    'name' => $agent->user->name,
+                    'email' => $agent->user->email,
+                    'da_code' => $agent->da_code,
+                    'avatar' => $agent->user->avatar,
+                    'assigned' => $agent->total_deliveries,
+                    'delivered' => $agent->successful_deliveries,
+                    'success_rate' => $agent->getSuccessRate(),
+                    'rating' => floatval($agent->rating),
+                    'status' => $this->getAgentStatus($agent),
+                ];
+            })
+            ->sortByDesc('success_rate')
+            ->take($limit)
+            ->values();
+
+        // Add rankings
+        $agents = $agents->map(function ($agent, $index) {
+            $agent['rank'] = $index + 1;
+            return $agent;
+        });
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'rankings' => $agents,
+                'meta' => [
+                    'total_agents' => $agents->count(),
+                ]
+            ]
+        ]);
+    }
+
+    /**
+     * Get delivery agent analytics
+     */
+    public function getAnalytics(Request $request): JsonResponse
+    {
+        $totalAgents = DeliveryAgent::count();
+        $activeAgents = DeliveryAgent::active()->count();
+        
+        $avgSuccessRate = DeliveryAgent::active()
+            ->withMinDeliveries()
+            ->get()
+            ->avg(function ($agent) {
+                return $agent->getSuccessRate();
+            });
+
+        $statusCounts = DeliveryAgent::active()
+            ->get()
+            ->groupBy(function ($agent) {
+                return $this->getAgentStatus($agent);
+            })
+            ->map->count();
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'overview' => [
+                    'total_delivery_agents' => $totalAgents,
+                    'active_agents' => $activeAgents,
+                    'average_success_rate' => round($avgSuccessRate ?? 0, 1),
+                    'status_breakdown' => [
+                        'excellent' => $statusCounts['excellent'] ?? 0,
+                        'good' => $statusCounts['good'] ?? 0,
+                        'warning' => $statusCounts['warning'] ?? 0,
+                        'critical' => $statusCounts['critical'] ?? 0,
+                    ],
+                ],
+            ]
+        ]);
+    }
+
+    /**
+     * Get individual delivery agent details
+     */
+    public function getAgentDetails(Request $request, int $agentId): JsonResponse
+    {
+        $user = User::find($agentId);
+        $deliveryAgent = DeliveryAgent::where('user_id', $agentId)->first();
+
+        if (!$user || !$deliveryAgent) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Delivery agent not found'
+            ], 404);
+        }
+
+        return response()->json([
+            'success' => true,
+            'data' => [
+                'agent' => [
+                    'id' => $user->id,
+                    'name' => $user->name,
+                    'email' => $user->email,
+                    'phone' => $user->phone,
+                    'avatar' => $user->avatar,
+                    'da_code' => $deliveryAgent->da_code,
+                ],
+                'performance' => [
+                    'total_deliveries' => $deliveryAgent->total_deliveries,
+                    'successful_deliveries' => $deliveryAgent->successful_deliveries,
+                    'success_rate' => $deliveryAgent->getSuccessRate(),
+                    'rating' => floatval($deliveryAgent->rating),
+                    'total_earnings' => floatval($deliveryAgent->total_earnings),
+                    'status' => $this->getAgentStatus($deliveryAgent),
+                ],
+            ]
+        ]);
+    }
+
+    /**
+     * Determine agent performance status
+     */
+    private function getAgentStatus($agent): string
+    {
+        $successRate = $agent->getSuccessRate();
+        $recentStrikes = $agent->recentStrikes()->count();
+        
+        if ($recentStrikes >= 3) return 'critical';
+        if ($successRate >= 95) return 'excellent';
+        if ($successRate >= 80) return 'good';
+        if ($successRate >= 60 || $recentStrikes >= 1) return 'warning';
+        
+        return 'critical';
+}
+}

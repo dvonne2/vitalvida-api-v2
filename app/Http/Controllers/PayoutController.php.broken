@@ -1,0 +1,660 @@
+<?php
+
+namespace App\Http\Controllers;
+
+use App\Models\Order;
+use App\Models\Payout;
+use App\Models\PayoutActionLog;
+use App\Helpers\SystemLogger;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+
+class PayoutController extends Controller
+{
+    /**
+     * Display a listing of payouts
+     */
+    public function index()
+    {
+        $payouts = Payout::with(['order'])
+            ->orderBy('created_at', 'desc')
+            ->paginate(20);
+
+        return response()->json([
+            'success' => true,
+            'data' => $payouts
+        ]);
+    }
+
+    /**
+     * Check if an order is eligible for payout
+     */
+    public function eligible($orderId)
+    {
+        $order = Order::with(['payment', 'otp', 'photo'])->find($orderId);
+
+        if (!$order) {
+            return response()->json(['error' => 'Order not found'], 404);
+        }
+
+        $hasPayment = $order->payment?->is_verified ?? false;
+        $otpSubmitted = $order->otp?->is_submitted ?? false;
+        $photoApproved = $order->photo?->is_approved ?? false;
+
+        if ($hasPayment && $otpSubmitted && $photoApproved) {
+            return response()->json([
+                'eligible' => true,
+                'order_id' => $order->id,
+                'message' => 'Order is eligible for payout'
+            ]);
+        }
+
+        return response()->json([
+            'eligible' => false,
+            'order_id' => $order->id,
+            'reason' => [
+                'payment' => $hasPayment,
+                'otp' => $otpSubmitted,
+                'photo' => $photoApproved,
+            ],
+            'message' => 'Order does not meet payout requirements'
+        ]);
+    }
+
+    // === SECURITY VERIFICATION METHODS ===
+
+    public function verifyOtpBeforePayout(Request $request)
+    {
+        try {
+            $orderId = $request->order_id;
+            $submittedOtp = $request->otp;
+            $daId = $request->da_id ?? auth()->id();
+
+            // Get order and check if payment was confirmed
+            $order = DB::table('orders')->where('id', $orderId)->first();
+            if (!$order) {
+                return response()->json(['success' => false, 'error' => 'Order not found'], 404);
+            }
+
+            // Check if payment was verified first
+            $paymentVerified = DB::table('system_logs')
+                ->where('type', 'payment_verified')
+                ->whereRaw("JSON_EXTRACT(context, '$.order_id') = ?", [$orderId])
+                ->exists();
+
+            if (!$paymentVerified) {
+                SystemLogger::logAction('fraud_attempt', $daId, request()->ip(), [
+                    'order_id' => $orderId,
+                    'fraud_type' => 'otp_attempt_without_payment',
+                    'da_id' => $daId
+                ]);
+                return response()->json(['success' => false, 'error' => 'Payment not verified'], 403);
+            }
+
+            // Get the correct OTP for this order
+            $correctOtp = DB::table('orders')->where('id', $orderId)->value('delivery_otp');
+            
+            if ($submittedOtp == $correctOtp) {
+                // OTP is correct
+                DB::table('orders')->where('id', $orderId)->update([
+                    'otp_verified' => true,
+                    'otp_verified_at' => now(),
+                    'updated_at' => now()
+                ]);
+
+                SystemLogger::logAction('otp_verified', $daId, request()->ip(), [
+                    'order_id' => $orderId,
+                    'da_id' => $daId,
+                    'customer_phone' => $order->customer_phone
+                ]);
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'OTP verified successfully',
+                    'order_id' => $orderId,
+                    'verified_at' => now()->toISOString()
+                ]);
+            } else {
+                // OTP failed
+                SystemLogger::logAction('otp_verification_failed', $daId, request()->ip(), [
+                    'order_id' => $orderId,
+                    'da_id' => $daId,
+                    'submitted_otp' => $submittedOtp
+                ]);
+
+                return response()->json([
+                    'success' => false,
+                    'error' => 'Invalid OTP',
+                    'order_id' => $orderId
+                ], 403);
+            }
+
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function checkPaymentMatch($orderId)
+    {
+        try {
+            $order = DB::table('orders')->where('id', $orderId)->first();
+            if (!$order) {
+                return response()->json(['success' => false, 'error' => 'Order not found'], 404);
+            }
+
+            // Simulate payment check (replace with actual Moniepoint API)
+            $paymentMatched = !empty($order->payment_reference);
+
+            if ($paymentMatched) {
+                SystemLogger::logAction('payment_verified', auth()->id(), request()->ip(), [
+                    'order_id' => $orderId,
+                    'amount' => $order->total_amount,
+                    'customer_phone' => $order->customer_phone,
+                    'payment_reference' => $order->payment_reference
+                ]);
+
+                return response()->json([
+                    'success' => true,
+                    'payment_matched' => true,
+                    'order_id' => $orderId,
+                    'amount' => $order->total_amount
+                ]);
+            } else {
+                return response()->json([
+                    'success' => false,
+                    'payment_matched' => false,
+                    'order_id' => $orderId,
+                    'error' => 'No payment reference found'
+                ]);
+            }
+
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function checkIMPhotoApproval($orderId)
+    {
+        try {
+            $order = DB::table('orders')->where('id', $orderId)->first();
+            if (!$order) {
+                return response()->json(['success' => false, 'error' => 'Order not found'], 404);
+            }
+
+            $daId = $order->assigned_da_id;
+            $currentWeek = now()->startOfWeek();
+
+            // Check if photo was approved this week
+            $photoApproved = DB::table('system_logs')
+                ->where('type', 'photo_approved')
+                ->whereRaw("JSON_EXTRACT(context, '$.da_id') = ?", [$daId])
+                ->where('created_at', '>=', $currentWeek)
+                ->exists();
+
+            return response()->json([
+                'success' => true,
+                'photo_status' => $photoApproved ? 'approved' : 'missing',
+                'da_id' => $daId,
+                'week_start' => $currentWeek->toDateString(),
+                'eligible_for_weekly_bonus' => $photoApproved
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function validateFullPayoutEligibility(Request $request)
+    {
+        try {
+            $orderId = $request->order_id;
+            $order = DB::table('orders')->where('id', $orderId)->first();
+            
+            if (!$order) {
+                return response()->json(['success' => false, 'error' => 'Order not found'], 404);
+            }
+
+            $reasons = [];
+            $eligible = true;
+
+            // 1. Check payment verification
+            $paymentVerified = DB::table('system_logs')
+                ->where('type', 'payment_verified')
+                ->whereRaw("JSON_EXTRACT(context, '$.order_id') = ?", [$orderId])
+                ->exists();
+
+            if (!$paymentVerified) {
+                $eligible = false;
+                $reasons[] = 'No payment record found';
+            }
+
+            // 2. Check OTP verification
+            if (!$order->otp_verified) {
+                $eligible = false;
+                $reasons[] = 'OTP not verified';
+            }
+
+            // 3. Check IM photo approval (for weekly bonus)
+            $photoCheck = $this->checkIMPhotoApproval($orderId);
+            $photoData = json_decode($photoCheck->getContent(), true);
+            
+            if ($photoData['photo_status'] !== 'approved') {
+                $eligible = false;
+                $reasons[] = 'Photo missing or unapproved';
+            }
+
+            // Log the eligibility result
+            if ($eligible) {
+                SystemLogger::logAction('payout_approved', auth()->id(), request()->ip(), [
+                    'order_id' => $orderId,
+                    'amount' => $order->total_amount,
+                    'da_id' => $order->assigned_da_id
+                ]);
+            } else {
+                SystemLogger::logAction('payout_blocked', auth()->id(), request()->ip(), [
+                    'order_id' => $orderId,
+                    'da_id' => $order->assigned_da_id,
+                    'reasons' => $reasons
+                ]);
+            }
+
+            return response()->json([
+                'success' => true,
+                'eligible' => $eligible,
+                'order_id' => $orderId,
+                'reasons' => $reasons,
+                'da_id' => $order->assigned_da_id,
+                'amount' => $order->total_amount,
+                'checked_at' => now()->toISOString()
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'error' => $e->getMessage()], 500);
+        }
+    }
+}
+
+    // === PAYOUT WORKFLOW METHODS ===
+
+    public function markIntent($orderId)
+    {
+        try {
+            $order = DB::table('orders')->where('id', $orderId)->first();
+            if (!$order) {
+                return response()->json(['error' => 'Order not found'], 404);
+            }
+
+            // Create or update payout record
+            $payoutId = DB::table('payouts')->insertGetId([
+                'order_id' => $orderId,
+                'amount' => $order->total_amount,
+                'status' => 'intent_marked',
+                'created_at' => now(),
+                'updated_at' => now()
+            ]);
+
+            SystemLogger::logAction('payout_intent_marked', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payoutId,
+                'amount' => $order->total_amount,
+                'da_id' => $order->assigned_da_id
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payout intent marked',
+                'payout_id' => $payoutId,
+                'order_id' => $orderId,
+                'status' => 'intent_marked',
+                'amount' => $order->total_amount
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function confirmReceipt($orderId)
+    {
+        try {
+            // This method only runs if middleware passed eligibility check
+            $payout = DB::table('payouts')->where('order_id', $orderId)->first();
+            
+            if (!$payout) {
+                return response()->json(['error' => 'Payout not found'], 404);
+            }
+
+            // Update payout status
+            DB::table('payouts')->where('id', $payout->id)->update([
+                'status' => 'receipt_confirmed',
+                'updated_at' => now()
+            ]);
+
+            // Trigger notification event
+            $this->notifyFinancialController($orderId, $payout->id);
+
+            SystemLogger::logAction('payout_receipt_confirmed', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payout->id,
+                'amount' => $payout->amount,
+                'da_id' => auth()->user()->delivery_agent_id ?? null
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Receipt confirmed - Financial Controller notified',
+                'payout_id' => $payout->id,
+                'status' => 'receipt_confirmed'
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function markPaid($orderId)
+    {
+        try {
+            $payout = DB::table('payouts')->where('order_id', $orderId)->first();
+            
+            if (!$payout) {
+                return response()->json(['error' => 'Payout not found'], 404);
+            }
+
+            // Final payout approval
+            DB::table('payouts')->where('id', $payout->id)->update([
+                'status' => 'paid',
+                'approved_by' => auth()->id(),
+                'approved_at' => now(),
+                'updated_at' => now()
+            ]);
+
+            SystemLogger::logAction('payout_marked_paid', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payout->id,
+                'amount' => $payout->amount,
+                'approved_by' => auth()->id()
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payout marked as paid',
+                'payout_id' => $payout->id,
+                'status' => 'paid',
+                'amount' => $payout->amount
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    private function notifyFinancialController($orderId, $payoutId)
+    {
+        // Log notification to FC and Compliance
+        SystemLogger::logAction('fc_notification_sent', auth()->id(), request()->ip(), [
+            'order_id' => $orderId,
+            'payout_id' => $payoutId,
+            'notification_type' => 'receipt_confirmed',
+            'recipients' => ['financial_controller', 'compliance_officer']
+        ]);
+
+        // TODO: Add email notification, WebSocket, or Slack integration
+    }
+
+    // === PAYOUT WORKFLOW METHODS ===
+
+    public function markIntent($orderId)
+    {
+        try {
+            $order = DB::table('orders')->where('id', $orderId)->first();
+            if (!$order) {
+                return response()->json(['error' => 'Order not found'], 404);
+            }
+
+            // Create or update payout record
+            $payoutId = DB::table('payouts')->insertGetId([
+                'order_id' => $orderId,
+                'amount' => $order->total_amount,
+                'status' => 'intent_marked',
+                'created_at' => now(),
+                'updated_at' => now()
+            ]);
+
+            SystemLogger::logAction('payout_intent_marked', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payoutId,
+                'amount' => $order->total_amount,
+                'da_id' => $order->assigned_da_id
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payout intent marked',
+                'payout_id' => $payoutId,
+                'order_id' => $orderId,
+                'status' => 'intent_marked',
+                'amount' => $order->total_amount
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function confirmReceipt($orderId)
+    {
+        try {
+            // This method only runs if middleware passed eligibility check
+            $payout = DB::table('payouts')->where('order_id', $orderId)->first();
+            
+            if (!$payout) {
+                return response()->json(['error' => 'Payout not found'], 404);
+            }
+
+            // Update payout status
+            DB::table('payouts')->where('id', $payout->id)->update([
+                'status' => 'receipt_confirmed',
+                'updated_at' => now()
+            ]);
+
+            // Trigger notification event
+            $this->notifyFinancialController($orderId, $payout->id);
+
+            SystemLogger::logAction('payout_receipt_confirmed', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payout->id,
+                'amount' => $payout->amount,
+                'da_id' => auth()->user()->delivery_agent_id ?? null
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Receipt confirmed - Financial Controller notified',
+                'payout_id' => $payout->id,
+                'status' => 'receipt_confirmed'
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function markPaid($orderId)
+    {
+        try {
+            $payout = DB::table('payouts')->where('order_id', $orderId)->first();
+            
+            if (!$payout) {
+                return response()->json(['error' => 'Payout not found'], 404);
+            }
+
+            // Final payout approval
+            DB::table('payouts')->where('id', $payout->id)->update([
+                'status' => 'paid',
+                'approved_by' => auth()->id(),
+                'approved_at' => now(),
+                'updated_at' => now()
+            ]);
+
+            SystemLogger::logAction('payout_marked_paid', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payout->id,
+                'amount' => $payout->amount,
+                'approved_by' => auth()->id()
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payout marked as paid',
+                'payout_id' => $payout->id,
+                'status' => 'paid',
+                'amount' => $payout->amount
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    private function notifyFinancialController($orderId, $payoutId)
+    {
+        // Log notification to FC and Compliance
+        SystemLogger::logAction('fc_notification_sent', auth()->id(), request()->ip(), [
+            'order_id' => $orderId,
+            'payout_id' => $payoutId,
+            'notification_type' => 'receipt_confirmed',
+            'recipients' => ['financial_controller', 'compliance_officer']
+        ]);
+
+        // TODO: Add email notification, WebSocket, or Slack integration
+    }
+
+    // === PAYOUT WORKFLOW METHODS ===
+
+    public function markIntent($orderId)
+    {
+        try {
+            $order = DB::table('orders')->where('id', $orderId)->first();
+            if (!$order) {
+                return response()->json(['error' => 'Order not found'], 404);
+            }
+
+            // Create or update payout record
+            $payoutId = DB::table('payouts')->insertGetId([
+                'order_id' => $orderId,
+                'amount' => $order->total_amount,
+                'status' => 'intent_marked',
+                'created_at' => now(),
+                'updated_at' => now()
+            ]);
+
+            SystemLogger::logAction('payout_intent_marked', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payoutId,
+                'amount' => $order->total_amount,
+                'da_id' => $order->assigned_da_id
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payout intent marked',
+                'payout_id' => $payoutId,
+                'order_id' => $orderId,
+                'status' => 'intent_marked',
+                'amount' => $order->total_amount
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function confirmReceipt($orderId)
+    {
+        try {
+            // This method only runs if middleware passed eligibility check
+            $payout = DB::table('payouts')->where('order_id', $orderId)->first();
+            
+            if (!$payout) {
+                return response()->json(['error' => 'Payout not found'], 404);
+            }
+
+            // Update payout status
+            DB::table('payouts')->where('id', $payout->id)->update([
+                'status' => 'receipt_confirmed',
+                'updated_at' => now()
+            ]);
+
+            // Trigger notification event
+            $this->notifyFinancialController($orderId, $payout->id);
+
+            SystemLogger::logAction('payout_receipt_confirmed', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payout->id,
+                'amount' => $payout->amount,
+                'da_id' => auth()->user()->delivery_agent_id ?? null
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Receipt confirmed - Financial Controller notified',
+                'payout_id' => $payout->id,
+                'status' => 'receipt_confirmed'
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    public function markPaid($orderId)
+    {
+        try {
+            $payout = DB::table('payouts')->where('order_id', $orderId)->first();
+            
+            if (!$payout) {
+                return response()->json(['error' => 'Payout not found'], 404);
+            }
+
+            // Final payout approval
+            DB::table('payouts')->where('id', $payout->id)->update([
+                'status' => 'paid',
+                'approved_by' => auth()->id(),
+                'approved_at' => now(),
+                'updated_at' => now()
+            ]);
+
+            SystemLogger::logAction('payout_marked_paid', auth()->id(), request()->ip(), [
+                'order_id' => $orderId,
+                'payout_id' => $payout->id,
+                'amount' => $payout->amount,
+                'approved_by' => auth()->id()
+            ]);
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payout marked as paid',
+                'payout_id' => $payout->id,
+                'status' => 'paid',
+                'amount' => $payout->amount
+            ]);
+
+        } catch (\Exception $e) {
+            return response()->json(['error' => $e->getMessage()], 500);
+        }
+    }
+
+    private function notifyFinancialController($orderId, $payoutId)
+    {
+        // Log notification to FC and Compliance
+        SystemLogger::logAction('fc_notification_sent', auth()->id(), request()->ip(), [
+            'order_id' => $orderId,
+            'payout_id' => $payoutId,
+            'notification_type' => 'receipt_confirmed',
+            'recipients' => ['financial_controller', 'compliance_officer']
+        ]);
+
+        // TODO: Add email notification, WebSocket, or Slack integration
+    }
+}

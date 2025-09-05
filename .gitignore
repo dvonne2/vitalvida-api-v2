@@ -1,0 +1,87 @@
+########################################
+# Laravel – Core
+########################################
+.DS_Store
+Thumbs.db
+
+# Environment files (never commit real envs)
+.env
+.env.*
+!.env.example
+
+# Vendor – install via composer on server
+/vendor/
+
+# Node – install via package manager on server
+/node_modules/
+**/node_modules/
+
+# Laravel caches & compiled files
+/bootstrap/cache/*.php
+!/bootstrap/cache/.gitignore
+/storage/*.key
+/storage/logs/*.log
+/storage/logs/*.log.*
+/storage/framework/cache/**
+/storage/framework/sessions/**
+/storage/framework/views/**
+/storage/framework/testing/**
+/storage/app/public/**
+
+# Public build artifacts
+/public/build/
+/public/hot
+/public/storage
+
+# PHPUnit / PHP tooling
+.phpunit.result.cache
+/.phpunit.cache
+.phpactor.json
+
+# IDE/editor
+/.idea/
+/.vscode/
+/.fleet/
+/.nova/
+/.zed/
+
+# Composer auth (sensitive)
+/auth.json
+
+# Temp, logs, pids, backups
+*.log
+*.dev.log
+*.pid
+*.bak
+*.backup
+system_audit_*.log
+
+# OS/Tooling
+/bun.lockb
+
+########################################
+# Nested Portals/Frontends (React/Vite/Next etc.)
+########################################
+# Common dist/build outputs
+**/dist/
+**/build/
+
+# Portal-specific envs (never commit)
+**/.env
+**/.env.local
+**/.env.*.local
+**/.env.production
+
+# Secure Admin Center portal
+/secure-admin-center-33/node_modules/
+/secure-admin-center-33/build/
+/secure-admin-center-33/dist/
+/secure-admin-center-33/.env*
+
+# Any temp or backup directories
+/backups/
+/logs/
+.logs/
+
+# Keep git placeholder files inside empty dirs
+!.gitkeep

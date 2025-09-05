@@ -1,0 +1,25 @@
+VitalVida Zoho Integration Cleanup List
+======================================
+
+FILES TO REMOVE:
+- app/Http/Controllers/Api/ZohoInventoryController.php
+- database/migrations/2025_07_06_160655_create_zoho_operation_logs_table.php
+
+DATABASE FIELDS TO KEEP (for migration history):
+- users.zoho_user_id
+- customers.zoho_contact_id  
+- purchase_orders.zoho_po_id
+
+ROUTES TO REVIEW:
+- Check routes/api.php for any Zoho-specific endpoints
+- Remove any references to ZohoInventoryController
+
+CONFIGURATION TO CLEAN:
+- Remove Zoho API credentials from .env
+- Clean up any Zoho-related service providers
+- Remove Zoho webhook endpoints
+
+BUSINESS IMPACT:
+- Zero impact on core business operations
+- All business logic is self-contained in Laravel
+- No external API dependencies after cleanup

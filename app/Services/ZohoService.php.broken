@@ -1,0 +1,269 @@
+<?php
+
+namespace App\Services;
+
+use Exception;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Cache;
+use Carbon\Carbon;
+
+class ZohoService
+{
+    protected $clientId;
+    protected $clientSecret;
+    protected $refreshToken;
+    protected $organizationId;
+    protected $region;
+    protected $baseUrl;
+    
+    const CACHE_KEY_TOKEN_DATA = 'zoho_token_data';
+    const CACHE_KEY_REFRESH_LOCK = 'zoho_refresh_lock';
+    const REFRESH_BUFFER_MINUTES = 5;
+    
+    public function __construct()
+    {
+        $this->clientId = config('services.zoho.client_id');
+        $this->clientSecret = config('services.zoho.client_secret');
+        $this->refreshToken = config('services.zoho.refresh_token');
+        $this->organizationId = config('services.zoho.organization_id');
+        $this->region = config('services.zoho.region', 'com');
+        $this->baseUrl = "https://www.zohoapis.com/inventory/v1";
+        
+        if (empty($this->clientId) || empty($this->clientSecret) || empty($this->refreshToken)) {
+            throw new Exception('Zoho credentials not properly configured');
+        }
+    }
+    
+    public function refreshToken(): array
+    {
+        $lockKey = self::CACHE_KEY_REFRESH_LOCK;
+        if (Cache::has($lockKey)) {
+            Log::info('Token refresh already in progress, waiting...');
+            sleep(2);
+            
+            $existingToken = $this->getCachedTokenData();
+            if ($existingToken && !$this->isTokenExpired($existingToken)) {
+                return $existingToken;
+            }
+        }
+        
+        Cache::put($lockKey, true, 30);
+        
+        try {
+            Log::info('Starting Zoho token refresh', [
+                'client_id' => substr($this->clientId, 0, 8) . '...',
+                'region' => $this->region
+            ]);
+            
+            $response = Http::timeout(30)
+                ->asForm()
+                ->post("https://accounts.zoho.{$this->region}/oauth/v2/token", [
+                    'refresh_token' => $this->refreshToken,
+                    'client_id' => $this->clientId,
+                    'client_secret' => $this->clientSecret,
+                    'grant_type' => 'refresh_token'
+                ]);
+            
+            if (!$response->successful()) {
+                throw new Exception('Token refresh failed: ' . $response->body());
+            }
+            
+            $tokenData = $response->json();
+            
+            if (!isset($tokenData['access_token'])) {
+                throw new Exception('Invalid token response: missing access_token');
+            }
+            
+            $enrichedTokenData = $this->enrichTokenData($tokenData);
+            $this->cacheTokenData($enrichedTokenData);
+            
+            Log::info('Zoho token refreshed successfully');
+            
+            return $enrichedTokenData;
+            
+        } catch (Exception $e) {
+            Log::error('Zoho token refresh failed', ['error' => $e->getMessage()]);
+            throw $e;
+        } finally {
+            Cache::forget($lockKey);
+        }
+    }
+    
+    public function getAccessToken(): string
+    {
+        $cachedToken = $this->getCachedTokenData();
+        
+        if ($cachedToken && !$this->isTokenExpired($cachedToken)) {
+            return $cachedToken['access_token'];
+        }
+        
+        $newTokenData = $this->refreshToken();
+        return $newTokenData['access_token'];
+    }
+    
+    public function getInventoryBaseUrl(): string
+    {
+        return $this->baseUrl;
+    }
+    
+    public function makeApiRequest(string $method, string $endpoint, array $data = [], array $params = []): array
+    {
+        $token = $this->getAccessToken();
+        
+        if (!isset($params['organization_id']) && $this->organizationId) {
+            $params['organization_id'] = $this->organizationId;
+        }
+        
+        $url = $this->baseUrl . '/' . ltrim($endpoint, '/');
+        
+        $request = Http::withHeaders([
+            'Authorization' => 'Zoho-oauthtoken ' . $token,
+            'Content-Type' => 'application/json'
+        ]);
+        
+        if (!empty($params)) {
+            $request = $request->withQueryParameters($params);
+        }
+        
+        $response = match(strtoupper($method)) {
+            'GET' => $request->get($url),
+            'POST' => $request->post($url, $data),
+            'PUT' => $request->put($url, $data),
+            'DELETE' => $request->delete($url, $data),
+            default => throw new Exception("Unsupported HTTP method: {$method}")
+        };
+        
+        if (!$response->successful()) {
+            throw new Exception("Zoho API request failed: {$response->status()} - {$response->body()}");
+        }
+        
+        return $response->json();
+    }
+    
+    public function getWarehouses(): array
+    {
+        return $this->makeApiRequest('GET', '/settings/warehouses');
+    }
+    
+    public function getStorageLocations(string $warehouseId, array $params = []): array
+    {
+        return $this->makeApiRequest('GET', "/settings/warehouses/{$warehouseId}/storagelocations", [], $params);
+    }
+    
+    public function getItems(array $params = []): array
+    {
+        return $this->makeApiRequest('GET', '/items', [], $params);
+    }
+    
+    public function createStorageLocation(array $binData): array
+    {
+        return $this->makeApiRequest('POST', '/storagelocations', $binData);
+    }
+    
+    public function getStockByBin(string $itemId, string $warehouseId): array
+    {
+        return $this->makeApiRequest('GET', '/autocomplete/storages', [], [
+            'item_id' => $itemId,
+            'warehouse_id' => $warehouseId
+        ]);
+    }
+    
+    protected function getCachedTokenData(): ?array
+    {
+        return Cache::get(self::CACHE_KEY_TOKEN_DATA);
+    }
+    
+    protected function isTokenExpired(array $tokenData): bool
+    {
+        if (!isset($tokenData['expires_at'])) {
+            return true;
+        }
+        
+        $expiryTime = Carbon::parse($tokenData['expires_at']);
+        $bufferTime = now()->addMinutes(self::REFRESH_BUFFER_MINUTES);
+        
+        return $bufferTime->greaterThanOrEqualTo($expiryTime);
+    }
+    
+    protected function enrichTokenData(array $rawTokenData): array
+    {
+        $expiresIn = $rawTokenData['expires_in'] ?? 3600;
+        
+        return [
+            'access_token' => $rawTokenData['access_token'],
+            'token_type' => $rawTokenData['token_type'] ?? 'Bearer',
+            'expires_in' => $expiresIn,
+            'expires_at' => now()->addSeconds($expiresIn)->toDateTimeString(),
+            'scope' => $rawTokenData['scope'] ?? null,
+            'refreshed_at' => now()->toDateTimeString(),
+        ];
+    }
+    
+    protected function cacheTokenData(array $tokenData): void
+    {
+        $ttlSeconds = ($tokenData['expires_in'] ?? 3600) - (self::REFRESH_BUFFER_MINUTES * 60);
+        Cache::put(self::CACHE_KEY_TOKEN_DATA, $tokenData, $ttlSeconds);
+    }
+    
+    public function getTokenStatus(): array
+    {
+        $cachedToken = $this->getCachedTokenData();
+        
+        if (!$cachedToken) {
+            return [
+                'status' => 'no_token',
+                'needs_refresh' => true
+            ];
+        }
+        
+        $isExpired = $this->isTokenExpired($cachedToken);
+        
+        return [
+            'status' => $isExpired ? 'expired' : 'valid',
+            'expires_at' => $cachedToken['expires_at'],
+            'needs_refresh' => $isExpired,
+        ];
+    }
+}
+
+    /**
+     * Get all locations from Zoho
+     */
+    public function getLocations(): array
+    {
+        return $this->makeApiRequest('GET', '/locations');
+    }
+    
+    /**
+     * Get zones for a specific location
+     */
+    public function getZones(string $locationId): array
+    {
+        return $this->makeApiRequest('GET', '/zones', [], [
+            'location_id' => $locationId
+        ]);
+    }
+    
+    /**
+     * Get FHG Delivery agents zones specifically
+     */
+    public function getFHGZones(): array
+    {
+        $fhgLocationId = config('services.zoho.fhg_location_id');
+        if (!$fhgLocationId) {
+            throw new Exception('FHG location ID not configured');
+        }
+        
+        return $this->getZones($fhgLocationId);
+    }
+    
+    /**
+     * Get bins/storage locations for a zone
+     */
+    public function getBinsForZone(string $zoneId): array
+    {
+        return $this->makeApiRequest('GET', '/storagelocations', [], [
+            'zone_id' => $zoneId
+        ]);
+    }
